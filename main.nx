@@ -1,0 +1,354 @@
+// ============================================================
+// Nyxilum Control Center — флагманський проєкт екосистеми: один
+// застосунок, що навмисно використовує ВСЮ широчінь стандартної
+// бібліотеки NyxilumLang в одному цільному сценарії (живий монітор
+// системи), а не як штучний чекліст:
+//
+//   - httpServer(handler, wsHandler) — веб-дашборд + живий push у браузер
+//   - NyxilumDb                       — історія метрик переживає рестарт
+//   - spawn/workerJoin                — фоновий збирач + перевірка ping
+//   - newChannel/channelSend/Receive  — живі оновлення в GUI-вікно
+//   - guiWindow + 2D-канва            — нативне вікно з живим графіком
+//   - procRun                         — зовнішня команда (ping)
+//   - regex                           — парсинг виводу ping
+//   - zipCreate                       — експорт історії одним файлом
+//   - gc_stats()                      — власне споживання пам'яті VM
+//   - try/catch                       — жоден збій одного джерела не валить решту
+// ============================================================
+
+var DB = null
+var GUI_CHANNEL = null
+var COLLECT_INTERVAL_MS = 2000
+var HISTORY_LIMIT = 120 // 2с * 120 = 4хв історії в пам'яті для графіка/API
+
+// ---------- збір метрик ----------
+
+func collectStats() {
+    var stats = newMap()
+    mapSet(stats, "time", timestamp())
+    mapSet(stats, "memMB", osMemory())
+    mapSet(stats, "cpuCount", osCpuCount())
+    var gc = gc_stats()
+    mapSet(stats, "gcAllocated", gc.allocated)
+    mapSet(stats, "gcBytesEstimate", gc.bytesEstimate)
+    return stats
+}
+
+// Фоновий воркер (spawn): збирає метрики раз на COLLECT_INTERVAL_MS,
+// пише в NyxilumDb (переживає рестарт) і штовхає в канал для GUI
+// (жива подія, а не опитування бази з інтервалом малювання).
+func collectorLoop() {
+    while (true) {
+        try {
+            var stats = collectStats()
+            var key = "hist:" + toString(toInt(mapGet(stats, "time")))
+            dbSet(DB, key, toJson(stats))
+            dbSet(DB, "latest", toJson(stats))
+            trimHistory()
+            channelSend(GUI_CHANNEL, stats)
+        } catch (e) {
+            print("[collector] помилка: " + e)
+        }
+        sleep(COLLECT_INTERVAL_MS)
+    }
+}
+
+func keyTime(k) {
+    return toInt(substring(k, 5, len(k) - 5))
+}
+
+func trimHistory() {
+    var keys = dbKeys(DB, "hist:")
+    if (len(keys) <= HISTORY_LIMIT) {
+        return
+    }
+    var sorted = sort(keys, func(a, b) { return keyTime(a) - keyTime(b) })
+    var toRemove = len(sorted) - HISTORY_LIMIT
+    var i = 0
+    while (i < toRemove) {
+        dbDelete(DB, sorted[i])
+        i = i + 1
+    }
+}
+
+func recentHistory() {
+    var keys = sort(dbKeys(DB, "hist:"), func(a, b) { return keyTime(a) - keyTime(b) })
+    var result = []
+    var i = 0
+    while (i < len(keys)) {
+        append(result, fromJson(dbGet(DB, keys[i])))
+        i = i + 1
+    }
+    return result
+}
+
+// ---------- ping через зовнішній процес + regex ----------
+
+func pingHost(host) {
+    var isWindows = contains(osPlatform(), "Windows")
+    var args = ["-c", "1", "-W", "2", host]
+    if (isWindows) {
+        args = ["-n", "1", "-w", "2000", host]
+    }
+    var result = procRun("ping", args)
+    var report = newMap()
+    if (result.exitCode != 0) {
+        mapSet(report, "ok", false)
+        mapSet(report, "error", "недоступний або тайм-аут")
+        return report
+    }
+    var latency = regexMatch(result.stdout, "(?<=time=)[0-9.]+")
+    mapSet(report, "ok", true)
+    if (latency != null) {
+        mapSet(report, "latencyMs", toDouble(latency))
+    }
+    return report
+}
+
+// ---------- HTTP + WS ----------
+
+func htmlEscape(s) {
+    s = replace(s, "&", "&amp;")
+    s = replace(s, "<", "&lt;")
+    return s
+}
+
+func jsonResponse(status, obj) {
+    var m = newMap()
+    mapSet(m, "status", status)
+    mapSet(m, "body", toJson(obj))
+    mapSet(m, "contentType", "application/json; charset=utf-8")
+    return m
+}
+
+func dashboardHtml() {
+    return "<!DOCTYPE html><html lang=\"uk\"><head><meta charset=\"utf-8\">" +
+        "<title>Nyxilum Control Center</title>" +
+        "<style>body{font-family:ui-monospace,monospace;background:#0d1117;color:#e6edf3;max-width:900px;margin:30px auto;padding:0 20px}" +
+        "canvas{background:#161b22;border:1px solid #30363d;border-radius:6px;width:100%;height:200px}" +
+        "code{background:#161b22;padding:2px 6px;border-radius:4px}" +
+        "input,button{font-family:inherit;background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px 10px}" +
+        "button{cursor:pointer}#log{white-space:pre-wrap;font-size:13px;color:#8b949e}</style></head><body>" +
+        "<h1>🖥️ Nyxilum Control Center</h1>" +
+        "<p>Пам'ять: <code id=\"mem\">-</code> МБ · GC-виділення: <code id=\"gc\">-</code> · " +
+        "<button onclick=\"doExport()\">Експортувати історію (zip)</button> <span id=\"exportResult\"></span></p>" +
+        "<canvas id=\"chart\" width=\"860\" height=\"200\"></canvas>" +
+        "<p><input id=\"host\" placeholder=\"адреса для ping (напр. 1.1.1.1)\" value=\"1.1.1.1\">" +
+        "<button onclick=\"doPing()\">Ping</button> <span id=\"pingResult\"></span></p>" +
+        "<div id=\"log\">З'єднання з WS...</div>" +
+        "<script>" +
+        "var canvas = document.getElementById('chart'); var ctx = canvas.getContext('2d');" +
+        "var history = [];" +
+        "function draw() {" +
+        "  ctx.clearRect(0,0,canvas.width,canvas.height);" +
+        "  if (history.length < 2) return;" +
+        "  var max = Math.max.apply(null, history.map(function(h){return h.memMB})) || 1;" +
+        "  ctx.strokeStyle = '#58a6ff'; ctx.lineWidth = 2; ctx.beginPath();" +
+        "  history.forEach(function(h, i) {" +
+        "    var x = (i / (history.length - 1)) * canvas.width;" +
+        "    var y = canvas.height - (h.memMB / max) * (canvas.height - 10) - 5;" +
+        "    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);" +
+        "  });" +
+        "  ctx.stroke();" +
+        "}" +
+        "fetch('/api/history').then(function(r){return r.json();}).then(function(h){ history = h; draw(); });" +
+        "var ws = new WebSocket('ws://' + location.host + '/live');" +
+        "ws.onmessage = function(e) {" +
+        "  var stats = JSON.parse(e.data);" +
+        "  document.getElementById('mem').textContent = Math.round(stats.memMB);" +
+        "  document.getElementById('gc').textContent = stats.gcAllocated;" +
+        "  document.getElementById('log').textContent = 'Онлайн, останнє оновлення: ' + new Date(stats.time*1000).toLocaleTimeString();" +
+        "  history.push(stats); if (history.length > 60) history.shift(); draw();" +
+        "};" +
+        "ws.onclose = function() { document.getElementById('log').textContent = 'З\\'єднання закрито'; };" +
+        "function doPing() {" +
+        "  var host = document.getElementById('host').value;" +
+        "  document.getElementById('pingResult').textContent = '...';" +
+        "  fetch('/api/ping?host=' + encodeURIComponent(host)).then(function(r){return r.json();}).then(function(r){" +
+        "    document.getElementById('pingResult').textContent = r.ok ? ('OK, ' + (r.latencyMs || '?') + ' мс') : ('недоступний: ' + r.error);" +
+        "  });" +
+        "}" +
+        "function doExport() {" +
+        "  document.getElementById('exportResult').textContent = '...';" +
+        "  fetch('/api/export').then(function(r){return r.json();}).then(function(r){" +
+        "    document.getElementById('exportResult').textContent = 'збережено на сервері: ' + r.path;" +
+        "  });" +
+        "}" +
+        "</script></body></html>"
+}
+
+func httpHandler(req) {
+    var path = mapGet(req, "path")
+    var method = mapGet(req, "method")
+    var query = mapGet(req, "query")
+
+    try {
+        if (path == "/" && method == "GET") {
+            var m = newMap()
+            mapSet(m, "status", 200)
+            mapSet(m, "body", dashboardHtml())
+            mapSet(m, "contentType", "text/html; charset=utf-8")
+            return m
+        }
+        if (path == "/api/history" && method == "GET") {
+            return jsonResponse(200, recentHistory())
+        }
+        if (path == "/api/gc" && method == "GET") {
+            return jsonResponse(200, gc_stats())
+        }
+        if (path == "/api/ping" && method == "GET") {
+            var host = "1.1.1.1"
+            if (contains(query, "host=")) {
+                var idx = indexOf(query, "host=")
+                var rest = substring(query, idx + 5, len(query) - idx - 5)
+                var ampIdx = indexOf(rest, "&")
+                if (ampIdx >= 0) {
+                    rest = substring(rest, 0, ampIdx)
+                }
+                host = rest
+            }
+            // spawn/workerJoin: пінг не блокує решту сервера, поки триває.
+            var worker = spawn(pingHost, host)
+            var result = workerJoin(worker, 5000)
+            return jsonResponse(200, result)
+        }
+        if (path == "/api/export" && method == "GET") {
+            // readFile/writeFile у NyxilumLang текстові (File.ReadAllText) -
+            // прогнати бінарний zip крізь них зіпсувало б байти, тож віддаємо
+            // не сам архів, а підтвердження + шлях, куди він реально ліг на
+            // диску сервера (zipCreate працює напряму з файловою системою).
+            var exportDir = "./export_tmp"
+            makeDir(exportDir)
+            var history = toJson(recentHistory())
+            writeFile(exportDir + "/history.json", history)
+            var zipPath = osCwd() + "/nyxilum-control-center-export.zip"
+            zipCreate(zipPath, exportDir)
+            deleteDir(exportDir)
+            var info = newMap()
+            mapSet(info, "ok", true)
+            mapSet(info, "path", zipPath)
+            mapSet(info, "entries", zipEntries(zipPath))
+            return jsonResponse(200, info)
+        }
+        var notFound = newMap()
+        mapSet(notFound, "status", 404)
+        mapSet(notFound, "body", "Не знайдено: " + htmlEscape(path))
+        return notFound
+    } catch (e) {
+        print("[http] помилка обробки " + method + " " + path + ": " + e)
+        var err = newMap()
+        mapSet(err, "status", 500)
+        mapSet(err, "body", "Внутрішня помилка")
+        return err
+    }
+}
+
+// Кожне WS-з'єднання - окремий потік/VM (httpServer.wsHandler): просто
+// опитуємо спільну (потокобезпечну) NyxilumDb й штовхаємо клієнту, коли
+// з'явилось щось нове - найпростіший надійний спосіб для довільної
+// кількості одночасних вкладок браузера без окремого реєстру підписників.
+func wsLiveHandler(ws, req) {
+    print("[ws] нове з'єднання")
+    var lastSent = ""
+    try {
+        while (true) {
+            var latest = dbGet(DB, "latest")
+            if (latest != null && latest != lastSent) {
+                wsSend(ws, latest)
+                lastSent = latest
+            }
+            // wsReceive(ws, 1000) замість sleep(1000): дає той самий такт
+            // опитування бази, АЛЕ ще й реально слухає сокет, тож
+            // close-фрейм від браузера (закрита вкладка) кидає виняток тут
+            // одразу, а не лишає потік крутитись назавжди після того, як
+            // клієнта вже нема. Браузер сам нічого в цей сокет не шле -
+            // результат ігноруємо, це чисто тайм-аут/детектор розриву.
+            wsReceive(ws, 1000)
+        }
+    } catch (e) {
+        // NyxilumLang не має finally - але єдиний вихід із while(true) вище
+        // це кинутий виняток (wsReceive/wsSend на розірваному сокеті), тож
+        // тут і є єдине місце, де цикл справді завершується.
+        print("[ws] з'єднання завершено: " + e)
+        wsClose(ws)
+    }
+}
+
+// ---------- GUI (опційно - деградує без падіння, якщо нема дисплея) ----------
+
+func runGui() {
+    var canvas = createCanvas("Nyxilum Control Center", 480, 220)
+    var history = []
+
+    while (!canvasShouldClose(canvas)) {
+        var sample = channelReceive(GUI_CHANNEL, 200)
+        if (sample != null) {
+            append(history, sample)
+            if (len(history) > 60) {
+                removeAt(history, 0)
+            }
+        }
+        clearCanvas(canvas, 22, 27, 34)
+        if (len(history) >= 2) {
+            var maxMem = 1.0
+            var i = 0
+            while (i < len(history)) {
+                if (mapGet(history[i], "memMB") > maxMem) { maxMem = mapGet(history[i], "memMB") }
+                i = i + 1
+            }
+            i = 1
+            while (i < len(history)) {
+                var x1 = toDouble(i - 1) / toDouble(len(history) - 1) * 480.0
+                var y1 = 200.0 - (mapGet(history[i - 1], "memMB") / maxMem) * 180.0
+                var x2 = toDouble(i) / toDouble(len(history) - 1) * 480.0
+                var y2 = 200.0 - (mapGet(history[i], "memMB") / maxMem) * 180.0
+                drawLine(canvas, x1, y1, x2, y2, 88, 166, 255)
+                i = i + 1
+            }
+        }
+        drawText(canvas, "Пам'ять: " + toString(osMemory()) + " МБ", 10, 200, 14, 230, 237, 243)
+        presentCanvas(canvas)
+    }
+    closeCanvas(canvas)
+}
+
+func startServer(port) {
+    httpServer(port, httpHandler, wsLiveHandler)
+}
+
+// ---------- вхідна точка ----------
+
+func main() {
+    var dataDir = osEnv("NCC_DATA")
+    if (dataDir == null || len(dataDir) == 0) {
+        dataDir = "./data"
+    }
+    DB = dbOpen(dataDir)
+    GUI_CHANNEL = newChannel()
+    print("[Nyxilum Control Center] База: " + dataDir)
+
+    var collector = spawn(collectorLoop)
+
+    var portStr = osEnv("PORT")
+    var port = 8090
+    if (portStr != null && len(portStr) > 0) {
+        port = toInt(portStr)
+    }
+    var server = spawn(startServer, port)
+    print("[Nyxilum Control Center] Веб-дашборд: http://localhost:" + toString(port) + "/")
+
+    var noGui = osEnv("NCC_NO_GUI")
+    if (noGui == "1") {
+        print("[Nyxilum Control Center] GUI вимкнено (NCC_NO_GUI=1) - лише консоль/веб.")
+        workerJoin(server)
+    } else {
+        try {
+            runGui()
+        } catch (e) {
+            print("[Nyxilum Control Center] GUI недоступне (" + e + ") - працюю лише як веб-сервер.")
+            workerJoin(server)
+        }
+    }
+}
+
+main()

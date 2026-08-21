@@ -252,20 +252,27 @@ func dashboardHtml() {
 
         "<script>" +
         "var canvas = document.getElementById('chart'); var ctx = canvas.getContext('2d');" +
-        "var history = [];" +
+        // НЕ "history" - це window.history (навігаційний API), готова
+        // властивість window, яку не можна тихо переприсвоїти через
+        // "var history = []" (нічого не кидає, просто НЕ спрацьовує) -
+        // history.push() потім падав TypeError'ом у КОЖНОМУ WS-повідомленні,
+        // і графік НІКОЛИ насправді не оновлювався новими точками з
+        // першого ж коміту - живцем зловлено через read_console_messages,
+        // не видно було жодним curl/get_page_text запитом.
+        "var statsHistory = [];" +
         "function draw() {" +
         "  ctx.clearRect(0,0,canvas.width,canvas.height);" +
-        "  if (history.length < 2) return;" +
-        "  var max = Math.max.apply(null, history.map(function(h){return h.memMB})) || 1;" +
+        "  if (statsHistory.length < 2) return;" +
+        "  var max = Math.max.apply(null, statsHistory.map(function(h){return h.memMB})) || 1;" +
         "  ctx.strokeStyle = '#58a6ff'; ctx.lineWidth = 2; ctx.beginPath();" +
-        "  history.forEach(function(h, i) {" +
-        "    var x = (i / (history.length - 1)) * canvas.width;" +
+        "  statsHistory.forEach(function(h, i) {" +
+        "    var x = (i / (statsHistory.length - 1)) * canvas.width;" +
         "    var y = canvas.height - (h.memMB / max) * (canvas.height - 10) - 5;" +
         "    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);" +
         "  });" +
         "  ctx.stroke();" +
         "}" +
-        "fetch('/api/history').then(function(r){return r.json();}).then(function(h){ history = h; draw(); });" +
+        "fetch('/api/history').then(function(r){return r.json();}).then(function(h){ statsHistory = h; draw(); });" +
         "var ws = new WebSocket('ws://' + location.host + '/live');" +
         "ws.onmessage = function(e) {" +
         "  var stats = JSON.parse(e.data);" +
@@ -273,7 +280,7 @@ func dashboardHtml() {
         "  document.getElementById('gc').textContent = stats.gcAllocated;" +
         "  document.getElementById('disk').textContent = (stats.diskFreeGB || '?') + ' / ' + (stats.diskTotalGB || '?') + ' ГБ вільно';" +
         "  document.getElementById('log').textContent = 'Онлайн, останнє оновлення: ' + new Date(stats.time*1000).toLocaleTimeString();" +
-        "  history.push(stats); if (history.length > 60) history.shift(); draw();" +
+        "  statsHistory.push(stats); if (statsHistory.length > 60) statsHistory.shift(); draw();" +
         "};" +
         "ws.onclose = function() { document.getElementById('log').textContent = 'З\\'єднання закрито'; };" +
 
@@ -297,11 +304,38 @@ func dashboardHtml() {
         "}" +
         "loadProcesses();" +
 
+        // Хости - НЕ довірені дані (будь-хто без автентифікації може їх
+        // POST-ити через /api/hosts, і вони зберігаються в базі для ВСІХ
+        // відвідувачів дашборду). Раніше h вставлявся прямо в innerHTML
+        // ТА всередину рядка "onclick='removeHost(\'' + h + '\')'" -
+        // подвійний вектор: HTML/script-ін'єкція через innerHTML, і
+        // окремо розрив рядка через onclick, якщо h містив одинарну
+        // лапку (напр. host = x'onclick='alert(1) реально спрацьовував).
+        // Тепер: DOM створюється через createElement/textContent (не
+        // innerHTML), а видалення - через data-атрибут і делегування
+        // подій (жодного інтерпольованого коду в атрибутах взагалі).
         "function renderHosts(hosts) {" +
-        "  document.getElementById('hostList').innerHTML = hosts.map(function(h){" +
-        "    return '<span class=\"pill\">'+h+' <span id=\"r_'+h+'\"></span> <button onclick=\"removeHost(\\''+h+'\\')\">×</button></span>';" +
-        "  }).join('');" +
+        "  var container = document.getElementById('hostList');" +
+        "  container.innerHTML = '';" +
+        "  hosts.forEach(function (h) {" +
+        "    var pill = document.createElement('span');" +
+        "    pill.className = 'pill';" +
+        "    pill.appendChild(document.createTextNode(h + ' '));" +
+        "    var result = document.createElement('span');" +
+        "    result.className = 'ping-result';" +
+        "    result.dataset.host = h;" +
+        "    pill.appendChild(result);" +
+        "    var btn = document.createElement('button');" +
+        "    btn.textContent = '×';" +
+        "    btn.className = 'remove-host';" +
+        "    btn.dataset.host = h;" +
+        "    pill.appendChild(btn);" +
+        "    container.appendChild(pill);" +
+        "  });" +
         "}" +
+        "document.getElementById('hostList').addEventListener('click', function (e) {" +
+        "  if (e.target.classList.contains('remove-host')) { removeHost(e.target.dataset.host); }" +
+        "});" +
         "function loadHosts() {" +
         "  fetch('/api/hosts').then(function(r){return r.json();}).then(renderHosts);" +
         "}" +
@@ -318,7 +352,7 @@ func dashboardHtml() {
         "function pingAll() {" +
         "  fetch('/api/ping-all').then(function(r){return r.json();}).then(function(results){" +
         "    results.forEach(function(res){" +
-        "      var el = document.getElementById('r_' + res.host);" +
+        "      var el = document.querySelector('.ping-result[data-host=\"' + CSS.escape(res.host) + '\"]');" +
         "      if (el) el.textContent = res.ok ? ('(' + (res.latencyMs || '?') + ' мс)') : '(недоступний)';" +
         "    });" +
         "  });" +
@@ -393,6 +427,15 @@ func httpHandler(req) {
                 mapSet(bad, "status", 400)
                 mapSet(bad, "body", "порожній хост")
                 return bad
+            }
+            // Максимальна довжина DNS-імені (253) з запасом - без цього
+            // ліміту довільний POST міг покласти в базу хоч 10КБ "сміття"
+            // назавжди (жива перевірка: curl -d "$(python3 -c 'print(\"a\"*10000)')").
+            if (len(newHost) > 255) {
+                var tooLong = newMap()
+                mapSet(tooLong, "status", 400)
+                mapSet(tooLong, "body", "хост задовгий (максимум 255 символів)")
+                return tooLong
             }
             var hosts = loadHosts()
             if (indexOf(hosts, newHost) < 0) {

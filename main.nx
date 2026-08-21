@@ -21,6 +21,15 @@ var GUI_CHANNEL = null
 var COLLECT_INTERVAL_MS = 2000
 var HISTORY_LIMIT = 120 // 2с * 120 = 4хв історії в пам'яті для графіка/API
 
+// Пороги для notify()-алертів. Кожен алерт спрацьовує ОДИН раз на перетин
+// порогу (клямка memAlerted/diskAlerted нижче), а не на кожному тіку -
+// інакше при пам'яті/диску, що стабільно за межею, ноут засипало б
+// сповіщеннями раз на 2с.
+var MEM_ALERT_MB = 500.0
+var DISK_ALERT_GB = 5.0
+var memAlerted = false
+var diskAlerted = false
+
 // ---------- збір метрик ----------
 
 func collectStats() {
@@ -31,7 +40,33 @@ func collectStats() {
     var gc = gc_stats()
     mapSet(stats, "gcAllocated", gc.allocated)
     mapSet(stats, "gcBytesEstimate", gc.bytesEstimate)
+    var disk = osDiskFree(".")
+    mapSet(stats, "diskFreeGB", disk.freeGB)
+    mapSet(stats, "diskTotalGB", disk.totalGB)
     return stats
+}
+
+// Клямка: алерт летить лише на ПЕРЕХІД через поріг (false -> true), а
+// повернення нижче порогу знову "заряджає" клямку для наступного разу.
+func checkAlert(value, threshold, aboveMeansAlert, alertedBefore, title, message) {
+    var isOver = false
+    if (aboveMeansAlert) {
+        isOver = value > threshold
+    } else {
+        isOver = value < threshold
+    }
+    if (isOver && !alertedBefore) {
+        try {
+            notify(title, message)
+        } catch (e) {
+            print("[alert] notify() не спрацював: " + e)
+        }
+        return true
+    }
+    if (!isOver) {
+        return false
+    }
+    return alertedBefore
 }
 
 // Фоновий воркер (spawn): збирає метрики раз на COLLECT_INTERVAL_MS,
@@ -46,6 +81,13 @@ func collectorLoop() {
             dbSet(DB, "latest", toJson(stats))
             trimHistory()
             channelSend(GUI_CHANNEL, stats)
+
+            memAlerted = checkAlert(mapGet(stats, "memMB"), MEM_ALERT_MB, true, memAlerted,
+                "Nyxilum Control Center",
+                "Пам'ять процесу перевищила " + toString(MEM_ALERT_MB) + " МБ")
+            diskAlerted = checkAlert(mapGet(stats, "diskFreeGB"), DISK_ALERT_GB, false, diskAlerted,
+                "Nyxilum Control Center",
+                "Вільного місця на диску лишилось менше " + toString(DISK_ALERT_GB) + " ГБ")
         } catch (e) {
             print("[collector] помилка: " + e)
         }
@@ -102,7 +144,61 @@ func pingHost(host) {
     if (latency != null) {
         mapSet(report, "latencyMs", toDouble(latency))
     }
+    mapSet(report, "host", host)
     return report
+}
+
+// Список хостів для моніторингу - один JSON-масив під одним ключем у
+// NyxilumDb (значення в v1 лише рядки, тож зберігаємо як toJson/fromJson),
+// а не окремий ключ на хост: список короткий, читається/пишеться цілком,
+// окремі ключі тут дали б лише зайву складність без вигоди.
+func loadHosts() {
+    var raw = dbGet(DB, "ping_hosts")
+    if (raw == null) {
+        return ["1.1.1.1", "8.8.8.8"]
+    }
+    return fromJson(raw)
+}
+
+func saveHosts(hosts) {
+    dbSet(DB, "ping_hosts", toJson(hosts))
+}
+
+func pingAllHosts() {
+    var hosts = loadHosts()
+    var workers = []
+    var i = 0
+    while (i < len(hosts)) {
+        append(workers, spawn(pingHost, hosts[i]))
+        i = i + 1
+    }
+    var results = []
+    i = 0
+    while (i < len(workers)) {
+        try {
+            append(results, workerJoin(workers[i], 5000))
+        } catch (e) {
+            var failed = newMap()
+            mapSet(failed, "host", hosts[i])
+            mapSet(failed, "ok", false)
+            mapSet(failed, "error", "тайм-аут")
+            append(results, failed)
+        }
+        i = i + 1
+    }
+    return results
+}
+
+// ---------- топ-процеси ----------
+
+func topProcesses(limit) {
+    var procs = osProcessList()
+    var sorted = sort(procs, func(a, b) { return b.memMB - a.memMB })
+    var n = limit
+    if (n > len(sorted)) {
+        n = len(sorted)
+    }
+    return slice(sorted, 0, n)
 }
 
 // ---------- HTTP + WS ----------
@@ -128,14 +224,32 @@ func dashboardHtml() {
         "canvas{background:#161b22;border:1px solid #30363d;border-radius:6px;width:100%;height:200px}" +
         "code{background:#161b22;padding:2px 6px;border-radius:4px}" +
         "input,button{font-family:inherit;background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px 10px}" +
-        "button{cursor:pointer}#log{white-space:pre-wrap;font-size:13px;color:#8b949e}</style></head><body>" +
+        "button{cursor:pointer}#log{white-space:pre-wrap;font-size:13px;color:#8b949e}" +
+        "table{width:100%;border-collapse:collapse;margin-top:8px}" +
+        "th,td{text-align:left;padding:4px 8px;border-bottom:1px solid #30363d;font-size:13px}" +
+        "th{color:#8b949e;font-weight:normal}" +
+        "h2{font-size:15px;color:#8b949e;margin-top:28px}" +
+        ".row{display:flex;gap:6px;align-items:center}" +
+        ".pill{background:#161b22;border:1px solid #30363d;border-radius:999px;padding:2px 10px;display:inline-flex;gap:8px;align-items:center;font-size:13px}" +
+        ".pill button{border:none;background:none;padding:0;color:#f85149;cursor:pointer}" +
+        "</style></head><body>" +
         "<h1>🖥️ Nyxilum Control Center</h1>" +
-        "<p>Пам'ять: <code id=\"mem\">-</code> МБ · GC-виділення: <code id=\"gc\">-</code> · " +
+        "<p>Пам'ять: <code id=\"mem\">-</code> МБ · GC-виділення: <code id=\"gc\">-</code> · Диск: <code id=\"disk\">-</code> · " +
         "<button onclick=\"doExport()\">Експортувати історію (zip)</button> <span id=\"exportResult\"></span></p>" +
         "<canvas id=\"chart\" width=\"860\" height=\"200\"></canvas>" +
-        "<p><input id=\"host\" placeholder=\"адреса для ping (напр. 1.1.1.1)\" value=\"1.1.1.1\">" +
-        "<button onclick=\"doPing()\">Ping</button> <span id=\"pingResult\"></span></p>" +
         "<div id=\"log\">З'єднання з WS...</div>" +
+
+        "<h2>Процеси (топ-15 за пам'яттю)</h2>" +
+        "<button onclick=\"loadProcesses()\">Оновити</button>" +
+        "<table><thead><tr><th>PID</th><th>Назва</th><th>Пам'ять, МБ</th><th>CPU, %</th></tr></thead>" +
+        "<tbody id=\"procs\"></tbody></table>" +
+
+        "<h2>Пінг хостів</h2>" +
+        "<div class=\"row\"><input id=\"newHost\" placeholder=\"новий хост (напр. google.com)\">" +
+        "<button onclick=\"addHost()\">Додати</button>" +
+        "<button onclick=\"pingAll()\">Пінгувати всі</button></div>" +
+        "<div id=\"hostList\" style=\"margin-top:8px;display:flex;flex-wrap:wrap;gap:6px\"></div>" +
+
         "<script>" +
         "var canvas = document.getElementById('chart'); var ctx = canvas.getContext('2d');" +
         "var history = [];" +
@@ -157,23 +271,59 @@ func dashboardHtml() {
         "  var stats = JSON.parse(e.data);" +
         "  document.getElementById('mem').textContent = Math.round(stats.memMB);" +
         "  document.getElementById('gc').textContent = stats.gcAllocated;" +
+        "  document.getElementById('disk').textContent = (stats.diskFreeGB || '?') + ' / ' + (stats.diskTotalGB || '?') + ' ГБ вільно';" +
         "  document.getElementById('log').textContent = 'Онлайн, останнє оновлення: ' + new Date(stats.time*1000).toLocaleTimeString();" +
         "  history.push(stats); if (history.length > 60) history.shift(); draw();" +
         "};" +
         "ws.onclose = function() { document.getElementById('log').textContent = 'З\\'єднання закрито'; };" +
-        "function doPing() {" +
-        "  var host = document.getElementById('host').value;" +
-        "  document.getElementById('pingResult').textContent = '...';" +
-        "  fetch('/api/ping?host=' + encodeURIComponent(host)).then(function(r){return r.json();}).then(function(r){" +
-        "    document.getElementById('pingResult').textContent = r.ok ? ('OK, ' + (r.latencyMs || '?') + ' мс') : ('недоступний: ' + r.error);" +
-        "  });" +
-        "}" +
+
         "function doExport() {" +
         "  document.getElementById('exportResult').textContent = '...';" +
         "  fetch('/api/export').then(function(r){return r.json();}).then(function(r){" +
         "    document.getElementById('exportResult').textContent = 'збережено на сервері: ' + r.path;" +
         "  });" +
         "}" +
+
+        "function escapeHtml(s) {" +
+        "  var d = document.createElement('div'); d.textContent = s; return d.innerHTML;" +
+        "}" +
+        "function loadProcesses() {" +
+        "  fetch('/api/processes').then(function(r){return r.json();}).then(function(procs){" +
+        "    document.getElementById('procs').innerHTML = procs.map(function(p){" +
+        "      var name = p.name.length > 40 ? p.name.slice(0, 40) + '…' : p.name;" +
+        "      return '<tr><td>'+p.pid+'</td><td>'+escapeHtml(name)+'</td><td>'+Math.round(p.memMB)+'</td><td>'+p.cpuPercent+'</td></tr>';" +
+        "    }).join('');" +
+        "  });" +
+        "}" +
+        "loadProcesses();" +
+
+        "function renderHosts(hosts) {" +
+        "  document.getElementById('hostList').innerHTML = hosts.map(function(h){" +
+        "    return '<span class=\"pill\">'+h+' <span id=\"r_'+h+'\"></span> <button onclick=\"removeHost(\\''+h+'\\')\">×</button></span>';" +
+        "  }).join('');" +
+        "}" +
+        "function loadHosts() {" +
+        "  fetch('/api/hosts').then(function(r){return r.json();}).then(renderHosts);" +
+        "}" +
+        "function addHost() {" +
+        "  var h = document.getElementById('newHost').value.trim();" +
+        "  if (!h) return;" +
+        "  fetch('/api/hosts', {method:'POST', body:h}).then(function(r){return r.json();}).then(function(hosts){" +
+        "    document.getElementById('newHost').value = ''; renderHosts(hosts);" +
+        "  });" +
+        "}" +
+        "function removeHost(h) {" +
+        "  fetch('/api/hosts?host=' + encodeURIComponent(h), {method:'DELETE'}).then(function(r){return r.json();}).then(renderHosts);" +
+        "}" +
+        "function pingAll() {" +
+        "  fetch('/api/ping-all').then(function(r){return r.json();}).then(function(results){" +
+        "    results.forEach(function(res){" +
+        "      var el = document.getElementById('r_' + res.host);" +
+        "      if (el) el.textContent = res.ok ? ('(' + (res.latencyMs || '?') + ' мс)') : '(недоступний)';" +
+        "    });" +
+        "  });" +
+        "}" +
+        "loadHosts();" +
         "</script></body></html>"
 }
 
@@ -229,6 +379,44 @@ func httpHandler(req) {
             mapSet(info, "path", zipPath)
             mapSet(info, "entries", zipEntries(zipPath))
             return jsonResponse(200, info)
+        }
+        if (path == "/api/processes" && method == "GET") {
+            return jsonResponse(200, topProcesses(15))
+        }
+        if (path == "/api/hosts" && method == "GET") {
+            return jsonResponse(200, loadHosts())
+        }
+        if (path == "/api/hosts" && method == "POST") {
+            var newHost = trim(mapGet(req, "body"))
+            if (len(newHost) == 0) {
+                var bad = newMap()
+                mapSet(bad, "status", 400)
+                mapSet(bad, "body", "порожній хост")
+                return bad
+            }
+            var hosts = loadHosts()
+            if (indexOf(hosts, newHost) < 0) {
+                append(hosts, newHost)
+                saveHosts(hosts)
+            }
+            return jsonResponse(200, hosts)
+        }
+        if (path == "/api/hosts" && method == "DELETE") {
+            var hostToRemove = ""
+            if (contains(query, "host=")) {
+                var idx2 = indexOf(query, "host=")
+                hostToRemove = substring(query, idx2 + 5, len(query) - idx2 - 5)
+            }
+            var hosts2 = loadHosts()
+            var idxRemove = indexOf(hosts2, hostToRemove)
+            if (idxRemove >= 0) {
+                removeAt(hosts2, idxRemove)
+                saveHosts(hosts2)
+            }
+            return jsonResponse(200, hosts2)
+        }
+        if (path == "/api/ping-all" && method == "GET") {
+            return jsonResponse(200, pingAllHosts())
         }
         var notFound = newMap()
         mapSet(notFound, "status", 404)

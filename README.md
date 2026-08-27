@@ -1,71 +1,73 @@
 # Nyxilum Control Center
 
-Живий монітор системи, написаний повністю на [NyxilumLang](https://github.com/Faneraiy14/NyxilumLang) — в один файл (`main.nx`), без жодної іншої мови чи бібліотеки. Заразом — флагманський проєкт екосистеми: навмисно використовує практично всю мову в одному цільному сценарії, а не як штучний чекліст функцій.
+*[Українською](README.uk.md)*
 
-## Що він робить
+Live system monitor written entirely in [NyxilumLang](https://github.com/Faneraiy14/NyxilumLang) — a single file (`main.nx`), no other language or library. At the same time, it's the ecosystem's flagship project: it deliberately exercises nearly the whole language in one coherent scenario, not as an artificial feature checklist.
 
-Запускаєш один файл — отримуєш веб-дашборд системи, який:
+## What it does
 
-- **Показує живі метрики** — пам'ять процесу, кількість CPU, власне споживання пам'яті самої VM (`gc_stats()`) — і оновлює їх у браузері БЕЗ перезавантаження сторінки, через WebSocket-пуш раз на 2 секунди.
-- **Малює графік пам'яті** просто в браузері (canvas + JS) з останніх ~2 хвилин історії.
-- **Пам'ятає історію між рестартами** — метрики пишуться в persistent-базу (`NyxilumDb`), тож `/api/history` після перезапуску сервера все одно поверне попередні дані.
-- **Пінгує список хостів** — додаєш адреси в дашборді (кожна зберігається в базі, переживає рестарт), тиснеш "Пінгувати всі" — сервер пінгує їх ПАРАЛЕЛЬНО (кожен у своєму потоці) і показує затримку біля кожної.
-- **Показує топ-15 процесів ОС** за пам'яттю разом із живим %CPU — як міні-`htop` прямо в браузері.
-- **Сповіщає на весь екран, коли щось не так** — системний push (той самий баблик, що й у месенджерів) летить, якщо пам'ять процесу чи вільне місце на диску перетнули поріг; більше не спамить, доки метрика не повернеться в норму й не перетне поріг знову.
-- **Експортує всю історію метрик** одним архівом (`zipCreate`) за клік — сервер пакує `history.json` у zip і повертає шлях до нього на диску.
-- **Не падає від жодного окремого збою.** Ping timeout, GC-помилка, зіпсована історія, недоступне сповіщення — кожне джерело даних обгорнуте в `try/catch` і не тягне за собою весь сервер.
-- **На Windows додатково відкриває нативне вікно** (Windows Forms canvas) із тим самим живим графіком пам'яті, окремо від браузера — оновлюється через канал (`newChannel`/`channelSend`/`channelReceive`) від фонового збирача, а не опитуванням. На Linux/Mac застосунок сам це виявляє і просто працює як веб-сервер, без падіння.
+Run one file — get a web dashboard that:
 
-Ендпоінти:
+- **Shows live metrics** — process memory, CPU count, the VM's own memory usage (`gc_stats()`) — and updates them in the browser WITHOUT a page reload, via a WebSocket push every 2 seconds.
+- **Draws a memory graph** right in the browser (canvas + JS) from the last ~2 minutes of history.
+- **Remembers history across restarts** — metrics are written to a persistent database (`NyxilumDb`), so `/api/history` still returns previous data after the server restarts.
+- **Pings a list of hosts** — add addresses in the dashboard (each one is saved to the database and survives a restart), hit "Ping all" — the server pings them IN PARALLEL (each on its own thread) and shows the latency next to each one.
+- **Shows the OS's top 15 processes** by memory along with live %CPU — a mini-`htop` right in the browser.
+- **Sends a full-screen notification when something's wrong** — a system push (the same kind of bubble as in messaging apps) fires if process memory or free disk space crosses a threshold; it won't spam again until the metric returns to normal and crosses the threshold once more.
+- **Exports the whole metrics history** as a single archive (`zipCreate`) with one click — the server packs `history.json` into a zip and returns its path on disk.
+- **Doesn't crash from any single failure.** Ping timeout, GC error, corrupted history, unreachable notification — each data source is wrapped in `try/catch` and won't take down the whole server.
+- **On Windows, additionally opens a native window** (Windows Forms canvas) with the same live memory graph, separate from the browser — updated via a channel (`newChannel`/`channelSend`/`channelReceive`) from the background collector, not by polling. On Linux/Mac the app detects this itself and simply runs as a web server, without crashing.
 
-| Маршрут | Що робить |
+Endpoints:
+
+| Route | What it does |
 |---|---|
-| `GET /` | сам дашборд (HTML + JS) |
-| `GET /api/history` | історія метрик у JSON |
-| `GET /api/gc` | поточна статистика GC самої VM |
-| `GET /api/processes` | топ-15 процесів ОС за пам'яттю, з %CPU |
-| `GET /api/hosts` | список хостів для моніторингу |
-| `POST /api/hosts` | додати хост (тіло запиту — сама адреса) |
-| `DELETE /api/hosts?host=...` | прибрати хост зі списку |
-| `GET /api/ping-all` | пінгує всі хости зі списку паралельно |
-| `GET /api/export` | пакує історію в zip на диску сервера, повертає шлях |
-| `WS /live` | живий потік нових метрик, раз на секунду перевіряє й штовхає, якщо є щось нове |
+| `GET /` | the dashboard itself (HTML + JS) |
+| `GET /api/history` | metrics history as JSON |
+| `GET /api/gc` | current GC stats of the VM itself |
+| `GET /api/processes` | OS's top 15 processes by memory, with %CPU |
+| `GET /api/hosts` | list of hosts being monitored |
+| `POST /api/hosts` | add a host (request body is the address itself) |
+| `DELETE /api/hosts?host=...` | remove a host from the list |
+| `GET /api/ping-all` | pings all hosts in the list in parallel |
+| `GET /api/export` | packs history into a zip on the server's disk, returns the path |
+| `WS /live` | live stream of new metrics, checks once a second and pushes if there's something new |
 
-## Які можливості мови тут показані
+## What language features this shows off
 
-- **`httpServer` + `NyxilumDb`** — веб-дашборд, історія метрик і список хостів переживають рестарт
-- **WebSocket-сервер** (`httpServer(port, handler, wsHandler)`) — живий пуш у браузер без опитування з боку клієнта
-- **`spawn`/`workerJoin`** — фоновий збирач метрик і кожна `ping`-перевірка (у тому числі всі хости одразу) виконуються в окремих потоках, не блокуючи сервер
-- **`newChannel`/`channelSend`/`channelReceive`** — живі оновлення для GUI-вікна (Windows-only)
-- **`createCanvas` + 2D-графіка** — нативне вікно з живим графіком пам'яті (Windows)
-- **`procRun` + `regex`** — `ping` до довільного хоста, парсинг latency з виводу
-- **`osProcessList()`** — список усіх процесів ОС з пам'яттю й %CPU
-- **`osDiskFree()`** — вільне/загальне місце на диску
-- **`notify()`** — системні push-сповіщення при перетині порогу пам'яті/диска
-- **`zipCreate`** — експорт історії метрик архівом
-- **`gc_stats()`** — власне споживання пам'яті VM видно прямо в дашборді
-- **`try/catch`** — жодне джерело даних не валить решту сервера при збої
+- **`httpServer` + `NyxilumDb`** — the web dashboard, metrics history, and host list all survive a restart
+- **WebSocket server** (`httpServer(port, handler, wsHandler)`) — live push to the browser without client-side polling
+- **`spawn`/`workerJoin`** — the background metrics collector and every `ping` check (including pinging all hosts at once) run on separate threads, without blocking the server
+- **`newChannel`/`channelSend`/`channelReceive`** — live updates for the GUI window (Windows-only)
+- **`createCanvas` + 2D graphics** — a native window with a live memory graph (Windows)
+- **`procRun` + `regex`** — running `ping` against an arbitrary host, parsing latency from the output
+- **`osProcessList()`** — list of all OS processes with memory and %CPU
+- **`osDiskFree()`** — free/total disk space
+- **`notify()`** — system push notifications when memory/disk crosses a threshold
+- **`zipCreate`** — exporting the metrics history as an archive
+- **`gc_stats()`** — the VM's own memory usage is visible right in the dashboard
+- **`try/catch`** — no data source can take down the rest of the server on failure
 
-`osProcessList()`, `osDiskFree()` і `notify()` не існували в NyxilumLang до цього проєкту — їх додано САМЕ тому, що Control Center їх потребував. Мова буквально росте разом із застосунком.
+`osProcessList()`, `osDiskFree()`, and `notify()` didn't exist in NyxilumLang before this project — they were added SPECIFICALLY because Control Center needed them. The language literally grows together with the app.
 
-## Запуск
+## Running it
 
 ```
 nx main.nx
 ```
 
-Дашборд буде на `http://localhost:8090/` (порт можна змінити через `PORT`). На Windows додатково відкриється нативне вікно з живим графіком; на Linux/Mac застосунок сам це помічає і працює лише як веб-сервер, без падіння.
+The dashboard will be at `http://localhost:8090/` (the port can be changed via `PORT`). On Windows, a native window with the live graph will also open; on Linux/Mac the app detects this itself and just runs as a web server, without crashing.
 
-### Змінні середовища
+### Environment variables
 
-- `PORT` — порт веб-сервера (типово `8090`)
-- `NCC_DATA` — тека для бази метрик (типово `./data`)
-- `NCC_NO_GUI=1` — примусово вимкнути GUI-вікно навіть на Windows
+- `PORT` — the web server's port (default `8090`)
+- `NCC_DATA` — folder for the metrics database (default `./data`)
+- `NCC_NO_GUI=1` — force-disable the GUI window even on Windows
 
-## Чому саме так
+## Why it's built this way
 
-Про потокобезпеку: воркер-збирач і HTTP/WS-обробники працюють у різних потоках, кожен зі своєю VM (`spawn`), але всі вони пишуть/читають ОДНУ й ту саму `NyxilumDb`-базу — хендли баз даних (і WebSocket, і канали) навмисно НЕ копіюються між потоками (`ConcurrencyModule.DeepCopy`), а передаються за посиланням, тож усі бачать одні й ті самі дані без гонок.
+On thread safety: the worker collector and the HTTP/WS handlers run on different threads, each with its own VM (`spawn`), but they all write to/read from the SAME `NyxilumDb` database — database handles (as well as WebSocket and channel handles) are deliberately NOT copied between threads (`ConcurrencyModule.DeepCopy`), but passed by reference, so everyone sees the same data with no races.
 
-## Ліцензія
+## License
 
-MIT, див. [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).

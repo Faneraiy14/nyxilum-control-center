@@ -29,6 +29,7 @@ Endpoints:
 | `GET /api/hosts` | list of hosts being monitored |
 | `POST /api/hosts` | add a host (request body is the address itself) |
 | `DELETE /api/hosts?host=...` | remove a host from the list |
+| `GET /api/ping?host=...` | pings a single host (defaults to `1.1.1.1`) |
 | `GET /api/ping-all` | pings all hosts in the list in parallel |
 | `GET /api/export` | packs history into a zip on the server's disk, returns the path |
 | `WS /live` | live stream of new metrics, checks once a second and pushes if there's something new |
